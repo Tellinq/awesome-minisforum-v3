@@ -1,6 +1,6 @@
 #!/bin/bash
 
-RYZENADJ="/path/to/ryzenadj"
+RYZENADJ="/usr/bin/ryzenadj"
 INTERVAL=5
 LASTKNOWN=""
 
