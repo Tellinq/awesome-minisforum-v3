@@ -155,4 +155,69 @@ EOF
     echo "Pacman hook installed at ${HOOK_FILE}"
 fi
 
+###############################################################################
+# Step 3: For APT systems, install a helper hook that runs only if any of the
+#         target packages are upgraded.
+###############################################################################
+if command -v apt-get &> /dev/null; then
+    echo "APT system detected. Installing APT hook..."
+
+    # Create a helper hook script that checks package versions.
+    APT_HOOK_SCRIPT="/usr/local/bin/alsa_workaround_apt_hook.sh"
+    cat << 'EOF' > "$APT_HOOK_SCRIPT"
+#!/bin/bash
+set -euo pipefail
+
+# Location to store last seen package versions.
+STATUS_FILE="/var/lib/alsa_workaround_status"
+# List of packages to monitor.
+PACKAGES=("alsa-card-profiles" "wireplumber" "pipewire-alsa" "alsa-firmware")
+
+declare -A current_versions
+
+# Gather current installed versions (or "none" if not installed).
+for pkg in "${PACKAGES[@]}"; do
+    version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo "none")
+    current_versions["$pkg"]="$version"
+done
+
+# Determine whether we need to run the workaround.
+run_update=0
+if [ ! -f "$STATUS_FILE" ]; then
+    run_update=1
+else
+    while IFS= read -r line; do
+        pkg=$(echo "$line" | cut -d' ' -f1)
+        stored_ver=$(echo "$line" | cut -d' ' -f2-)
+        if [ "${current_versions[$pkg]}" != "$stored_ver" ]; then
+            run_update=1
+            break
+        fi
+    done < "$STATUS_FILE"
+fi
+
+if [ "$run_update" -eq 1 ]; then
+    /usr/local/bin/alsa_workaround.sh
+    # Overwrite the status file with current versions.
+    > "$STATUS_FILE"
+    for pkg in "${PACKAGES[@]}"; do
+        echo "$pkg ${current_versions[$pkg]}" >> "$STATUS_FILE"
+    done
+fi
+
+exit 0
+EOF
+    chmod +x "$APT_HOOK_SCRIPT"
+    echo "APT hook helper installed at ${APT_HOOK_SCRIPT}"
+
+    # Install the APT configuration hook so that the helper runs after each dpkg transaction.
+    APT_CONFIG_FILE="/etc/apt/apt.conf.d/99alsa-workaround"
+    cat << 'EOF' > "$APT_CONFIG_FILE"
+DPkg::Post-Invoke {
+    "if [ -x /usr/local/bin/alsa_workaround_apt_hook.sh ]; then /usr/local/bin/alsa_workaround_apt_hook.sh; fi";
+};
+EOF
+    echo "APT DPkg::Post-Invoke hook installed at ${APT_CONFIG_FILE}"
+fi
+
 echo "Installation complete."
