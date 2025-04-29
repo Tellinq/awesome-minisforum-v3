@@ -111,15 +111,25 @@ fi
 if [ "$restart_service" = true ]; then
     echo "Configuration differences detected; restarting wireplumber service..."
 
-    logged_in_users=$(who | awk '{print $1}' | sort -u)
-    for user in $logged_in_users; do
-        XDG_RUNTIME_DIR="/run/user/$(id -u $user)"
-        if command -v su >/dev/null 2>&1; then
-            su "$user" -c "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} systemctl --user restart wireplumber.service"
-        else
-            printf "Warning: 'su' command not found. Skipping user %s.\n" "$user"
-        fi
-    done
+	logged_in_users=$(ps -eo user= | sort -u)
+
+	for user in $logged_in_users; do
+		# Skip invalid, unavailable, or expired users
+		if [[ ! "$user" =~ ^[a-zA-Z0-9._-]+$ ]] || ! passwd -S "$user" &>/dev/null || [[ "$(passwd -S "$user" | awk '{print $2}')" =~ ^(L|E)$ ]]; then
+			continue
+		fi
+
+		XDG_RUNTIME_DIR="/run/user/$(id -u $user 2>/dev/null)"
+		if [[ -d "$XDG_RUNTIME_DIR" ]]; then
+		    if command -v su >/dev/null 2>&1; then
+		        su "$user" -c "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} systemctl --user restart wireplumber.service"
+		    else
+		        printf "Warning: 'su' command not found. Skipping user %s.\n" "$user"
+		    fi
+		else
+		    printf "Warning: XDG_RUNTIME_DIR not found for %s. Skipping.\n" "$user"
+		fi
+	done
 fi
 
 ###########################################################################
