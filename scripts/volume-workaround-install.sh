@@ -26,118 +26,251 @@ fi
 TARGET_SCRIPT="/usr/local/bin/alsa_workaround.sh"
 cat << "EOF" > "$TARGET_SCRIPT"
 #!/bin/bash
-set -uo pipefail
+# set -euo pipefail
 
-# === Configuration File Paths ===
+###############################################################################
+# Step 1: Ensure we’re running as root.
+###############################################################################
+
+if [[ $EUID -ne 0 ]]; then
+    echo "This installer must be run as root. Use sudo." >&2
+    exit 1
+fi
+
+###############################################################################
+# Step 2: Define WirePlumber restart function.
+###############################################################################
+
+restart_wireplumber() {
+    echo "Restarting WirePlumber service..."
+
+    logged_in_users=$(ps -eo user= | sort -u)
+
+    for user in $logged_in_users; do
+        # Skip invalid, unavailable, or expired users
+        if [[ ! "$user" =~ ^[a-zA-Z0-9._-]+$ ]] || ! passwd -S "$user" &>/dev/null || [[ "$(passwd -S "$user" | awk '{print $2}')" =~ ^(L|E)$ ]]; then
+            continue
+        fi
+
+        XDG_RUNTIME_DIR="/run/user/$(id -u $user 2>/dev/null)"
+        if [[ -d "$XDG_RUNTIME_DIR" ]]; then
+            if command -v su >/dev/null 2>&1; then
+                su "$user" -c "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} systemctl --user restart wireplumber.service"
+            else
+                printf "Warning: 'su' command not found. Skipping user %s.\n" "$user"
+            fi
+        else
+            printf "Warning: XDG_RUNTIME_DIR not found for %s. Skipping.\n" "$user"
+        fi
+    done
+}
+
+###############################################################################
+# Step 3: Check ALSA configuration files for patch application.
+###############################################################################
+
 CONF_COMMON="/usr/share/alsa-card-profile/mixer/paths/analog-output.conf.common"
 CONF_HEADPHONES="/usr/share/alsa-card-profile/mixer/paths/analog-output-headphones.conf"
 
-# === Create Timestamped Backups ===
-timestamp=$(date +%Y%m%d%H%M%S)
-backup_common="${CONF_COMMON}.bak.${timestamp}"
-backup_headphones="${CONF_HEADPHONES}.bak.${timestamp}"
-cp "$CONF_COMMON" "$backup_common"
-cp "$CONF_HEADPHONES" "$backup_headphones"
-echo "Backups created:"
-echo "  $backup_common"
-echo "  $backup_headphones"
+if [[ ! -r "$CONF_COMMON" || ! -r "$CONF_HEADPHONES" ]]; then
+    echo "Unable to read ALSA configuration files. Assuming first patch is not present."
+    USE_SOFTMIXER=true
+else
+    echo "ALSA configuration files are readable. Proceeding with verification..."
+    USE_SOFTMIXER=false
+fi
 
-###########################################################################
-# STEP 1:
-# If [Element Master] does not exist in CONF_COMMON, insert the following block
-# immediately before the first occurrence of [Element PCM].
-# The block to insert is exactly:
-#
-#   [Element Master]
-#   switch = mute
-#   volume = ignore
-#
-###########################################################################
-if ! grep -Fxq "[Element Master]" "$CONF_COMMON"; then
-    echo "Inserting [Element Master] block into $CONF_COMMON before [Element PCM]."
+###############################################################################
+# Step 4: Copy ALSA configuration files to a writable location.
+###############################################################################
+
+TMP_COMMON="/tmp/analog-output.conf.common.tmp"
+TMP_HEADPHONES="/tmp/analog-output-headphones.conf.tmp"
+
+cp "$CONF_COMMON" "$TMP_COMMON"
+cp "$CONF_HEADPHONES" "$TMP_HEADPHONES"
+
+###############################################################################
+# Step 5: Apply patch to temporary files.
+###############################################################################
+
+if ! grep -Fxq "[Element Master]" "$TMP_COMMON"; then
+    echo "Inserting [Element Master] block into $TMP_COMMON before [Element PCM]."
     awk 'BEGIN { inserted = 0 }
          {
              if ($0 == "[Element PCM]" && inserted == 0) {
-                 # Print the block precisely with exactly three lines.
                  printf "[Element Master]\nswitch = mute\nvolume = ignore\n\n";
                  inserted = 1;
              }
              print $0;
-         }' "$CONF_COMMON" > "${CONF_COMMON}.tmp" && mv "${CONF_COMMON}.tmp" "$CONF_COMMON"
+         }' "$TMP_COMMON" > "${TMP_COMMON}.patched"
+else
+    cp "$TMP_COMMON" "${TMP_COMMON}.patched"  # Ensure the file exists
 fi
 
-###########################################################################
-# STEP 2:
-# If [Element Master] exists in CONF_COMMON (which it should now), then in the
-# CONF_HEADPHONES file, override any line within the [Element Master] block that
-# begins with "volume =" to read exactly "volume = ignore".
-###########################################################################
-if grep -Fxq "[Element Master]" "$CONF_COMMON"; then
-    echo "[Element Master] exists in $CONF_COMMON; modifying HEADPHONES config accordingly."
-    if grep -Fxq "[Element Master]" "$CONF_HEADPHONES"; then
-        awk 'BEGIN { inMaster = 0 }
-             {
-                 if ($0 == "[Element Master]") {
-                     inMaster = 1;
-                     print $0;
-                     next;
-                 }
-                 # If a new block starts (the first character is “[”) reset the flag.
-                 if (inMaster && substr($0, 1, 1) == "[") { inMaster = 0 }
-                 # While inside the [Element Master] block, if the line begins with "volume =", override it.
-                 if (inMaster && index($0, "volume =") == 1) {
-                     print "volume = ignore";
-                     next;
-                 }
+if grep -Fxq "[Element Master]" "$TMP_HEADPHONES"; then
+    awk 'BEGIN { inMaster = 0 }
+         {
+             if ($0 == "[Element Master]") {
+                 inMaster = 1;
                  print $0;
-             }' "$CONF_HEADPHONES" > "${CONF_HEADPHONES}.tmp" && mv "${CONF_HEADPHONES}.tmp" "$CONF_HEADPHONES"
+                 next;
+             }
+             if (inMaster && substr($0, 1, 1) == "[") { inMaster = 0 }
+             if (inMaster && index($0, "volume =") == 1) {
+                 print "volume = ignore";
+                 next;
+             }
+             print $0;
+         }' "$TMP_HEADPHONES" > "${TMP_HEADPHONES}.patched"
+else
+    cp "$TMP_HEADPHONES" "${TMP_HEADPHONES}.patched"  # Ensure file exists even if unchanged
+fi
+
+
+###############################################################################
+# Step 6: Compare patched temporary files with originals.
+###############################################################################
+
+if cmp -s "$TMP_COMMON" "${TMP_COMMON}.patched" && cmp -s "$TMP_HEADPHONES" "${TMP_HEADPHONES}.patched"; then
+    echo "First patch was already applied. No further action needed."
+    rm -f "$TMP_COMMON" "$TMP_HEADPHONES" "${TMP_COMMON}.patched" "${TMP_HEADPHONES}.patched"
+else
+    echo "First patch is missing and needs to be applied."
+    echo "Differences detected:"
+    diff "$TMP_COMMON" "${TMP_COMMON}.patched"
+    diff "$TMP_HEADPHONES" "${TMP_HEADPHONES}.patched"
+
+    ###############################################################################
+    # Step 6.5: Attempt to apply first patch to original files.
+    ###############################################################################
+
+    if [[ -w "$CONF_COMMON" && -w "$CONF_HEADPHONES" ]]; then
+        echo "Applying first patch to ALSA profile files..."
+        cp "${TMP_COMMON}.patched" "$CONF_COMMON"
+        cp "${TMP_HEADPHONES}.patched" "$CONF_HEADPHONES"
+
+        # Ensure patch files exist before comparing
+        if [[ ! -f "${TMP_COMMON}.patched" || ! -f "${TMP_HEADPHONES}.patched" ]]; then
+            echo "Error: Expected patch files were not created!"
+            ls -l "${TMP_COMMON}.patched" "${TMP_HEADPHONES}.patched"  # Print file details
+            exit 1
+        fi
+
+        # Verify changes were applied successfully
+        if cmp -s "$CONF_COMMON" "${TMP_COMMON}.patched" && cmp -s "$CONF_HEADPHONES" "${TMP_HEADPHONES}.patched"; then
+            echo "First patch successfully applied."
+            rm -f "$TMP_COMMON" "$TMP_HEADPHONES"
+            restart_wireplumber
+            exit 0
+        else
+            echo "Warning: Patch attempt made, but files were not updated correctly!"
+
+            # Additional debugging output
+            echo "Checking if files were modified..."
+            diff "$CONF_COMMON" "${TMP_COMMON}.patched" || echo "No differences found in $CONF_COMMON"
+            diff "$CONF_HEADPHONES" "${TMP_HEADPHONES}.patched" || echo "No differences found in $CONF_HEADPHONES"
+
+            echo "Checking write permissions..."
+            ls -ld "$(dirname "$CONF_COMMON")" "$(dirname "$CONF_HEADPHONES")"
+
+            exit 1
+        fi
+
     else
-        echo "[Element Master] block not found in $CONF_HEADPHONES; skipping modification of that file."
+        echo "First patch location is not writable. Falling back to soft mixer patch."
+        USE_SOFTMIXER=true
     fi
 fi
 
-###########################################################################
-# STEP 3:
-# Only restart the wireplumber service if either configuration file differs
-# from its original backup.
-###########################################################################
-restart_service=false
+###############################################################################
+# Step 7: Apply soft mixer patch if necessary.
+###############################################################################
 
-if ! cmp -s "$CONF_COMMON" "$backup_common" || ! cmp -s "$CONF_HEADPHONES" "$backup_headphones"; then
-    restart_service=true
+if [[ "$USE_SOFTMIXER" = true ]]; then
+    SOFTMIXER_CONFIG='
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.*pci-0000_c4_00.6.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.soft-mixer = true
+      }
+    }
+  },
+  {
+    matches = [
+      {
+        device.name = "~alsa_card.*"
+        node.name = "~alsa_input.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.soft-mixer = false
+      }
+    }
+  }
+]
+'
+
+    GLOBAL_CONF="/etc/wireplumber/wireplumber.conf.d/alsa-soft-mixer.conf"
+    USER_CONF="$HOME/.config/wireplumber/wireplumber.conf.d/alsa-soft-mixer.conf"
+
+    # Check if either configuration file already exists
+    if [[ -f "$GLOBAL_CONF" || -f "$USER_CONF" ]]; then
+        echo "Soft mixer patch already exists—no changes needed."
+        exit 0
+    fi
+
+    # Function to recursively check and create writable directories
+    ensure_writable_path() {
+        local target_dir="$1"
+
+        while [[ -n "$target_dir" ]]; do
+            if [[ -w "$target_dir" ]]; then
+                echo "Writable directory found: $target_dir"
+                mkdir -p "$1"  # Create missing directories
+                return 0
+            fi
+            target_dir=$(dirname "$target_dir")  # Move up one level
+        done
+
+        echo "No writable directory found for $1. Manual intervention required."
+        return 1
+    }
+
+    # Attempt to apply the soft mixer patch globally **first**
+    if ensure_writable_path "/etc/wireplumber/wireplumber.conf.d"; then
+        echo "Applying soft mixer patch globally..."
+        echo "$SOFTMIXER_CONFIG" > "$GLOBAL_CONF"
+        restart_wireplumber
+        exit 0  # **Exit immediately if successful**
+    fi
+
+    # If global path failed, attempt user-specific path
+    if ensure_writable_path "$HOME/.config/wireplumber/wireplumber.conf.d"; then
+        echo "Applying soft mixer patch for current user..."
+        echo "$SOFTMIXER_CONFIG" > "$USER_CONF"
+        restart_wireplumber
+        exit 0
+    fi
+
+    # If neither path worked, require manual intervention
+    echo "Neither configuration path is writable. Manual intervention required."
+    exit 1
+
+
 fi
-
-
-if [ "$restart_service" = true ]; then
-    echo "Configuration differences detected; restarting wireplumber service..."
-
-	logged_in_users=$(ps -eo user= | sort -u)
-
-	for user in $logged_in_users; do
-		# Skip invalid, unavailable, or expired users
-		if [[ ! "$user" =~ ^[a-zA-Z0-9._-]+$ ]] || ! passwd -S "$user" &>/dev/null || [[ "$(passwd -S "$user" | awk '{print $2}')" =~ ^(L|E)$ ]]; then
-			continue
-		fi
-
-		XDG_RUNTIME_DIR="/run/user/$(id -u $user 2>/dev/null)"
-		if [[ -d "$XDG_RUNTIME_DIR" ]]; then
-		    if command -v su >/dev/null 2>&1; then
-		        su "$user" -c "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} systemctl --user restart wireplumber.service"
-		    else
-		        printf "Warning: 'su' command not found. Skipping user %s.\n" "$user"
-		    fi
-		else
-		    printf "Warning: XDG_RUNTIME_DIR not found for %s. Skipping.\n" "$user"
-		fi
-	done
-fi
-
-###########################################################################
-# STEP 4:
-# Cleanup.
-###########################################################################
-rm -f "$backup_common" "$backup_headphones"
 EOF
+
+chmod +x "$TARGET_SCRIPT"
+
+"$TARGET_SCRIPT"
 
 echo "Workaround script installed at ${TARGET_SCRIPT}"
 
